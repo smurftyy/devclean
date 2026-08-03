@@ -211,6 +211,64 @@ def test_delete_items_surfaces_error_when_original_removal_fails_after_trash(
     assert manager.load_records().records == ()
 
 
+def test_delete_items_compress_path_calls_happen_in_safety_order(
+    tmp_path: Path, fake_trash, monkeypatch
+) -> None:
+    """Pins the exact call order of the compress-before-trash contract:
+    compress, then verify, then send2trash, then (only now) remove the
+    original. The other tests above prove the *symptom* (a failure at each
+    step leaves the source alone); this one asserts the *cause* directly, so
+    a refactor that reorders these four calls fails immediately here even if
+    it doesn't happen to break any single failure-injection test. This is
+    precisely the invariant PR #12 violated: it called rmtree(source) before
+    send2trash ran at all.
+    """
+    source = tmp_path / "workspace" / "node_modules"
+    source.mkdir(parents=True)
+    (source / "a.txt").write_text("A" * 2048, encoding="utf-8")
+    original_size = sum(f.stat().st_size for f in source.rglob("*") if f.is_file())
+
+    calls: list[str] = []
+
+    import devklean.deletion.trash as trash_module
+
+    real_compress_path = trash_module.compress_path
+    real_verify_archive = trash_module.verify_archive
+    real_send2trash = trash_module.send2trash
+    real_rmtree = trash_module.shutil.rmtree
+
+    def _compress_path(*args, **kwargs):
+        calls.append("compress")
+        return real_compress_path(*args, **kwargs)
+
+    def _verify_archive(*args, **kwargs):
+        calls.append("verify")
+        return real_verify_archive(*args, **kwargs)
+
+    def _send2trash(*args, **kwargs):
+        calls.append("send2trash")
+        return real_send2trash(*args, **kwargs)
+
+    def _rmtree(*args, **kwargs):
+        calls.append("rmtree")
+        return real_rmtree(*args, **kwargs)
+
+    monkeypatch.setattr(trash_module, "compress_path", _compress_path)
+    monkeypatch.setattr(trash_module, "verify_archive", _verify_archive)
+    monkeypatch.setattr(trash_module, "send2trash", _send2trash)
+    monkeypatch.setattr(trash_module.shutil, "rmtree", _rmtree)
+
+    item = CleanableItem(str(source), "node_modules", original_size, "Node.js")
+    manager = MetadataManager(storage_dir=tmp_path / "m")
+
+    result = delete_items(
+        [item], item.size, metadata_manager=manager, compress=True, compress_min_size=0
+    )
+
+    assert result.deleted == (str(source),)
+    assert calls == ["compress", "verify", "send2trash", "rmtree"]
+
+
 def test_delete_items_does_not_call_send2trash_on_dry_run(tmp_path: Path, fake_trash) -> None:
     source = tmp_path / "workspace" / "node_modules"
     source.mkdir(parents=True)
